@@ -1,49 +1,515 @@
-# History files
-.Rhistory
-.Rapp.history
-
-# Session Data files
-.RData
-.RDataTmp
-
-# User-specific files
-.Ruserdata
-
-# Example code in package build process
-*-Ex.R
-
-# Output files from R CMD build
-/*.tar.gz
-
-# Output files from R CMD check
-/*.Rcheck/
-
-# RStudio files
-.Rproj.user/
-
-# produced vignettes
-vignettes/*.html
-vignettes/*.pdf
-
-# OAuth2 token, see https://github.com/hadley/httr/releases/tag/v0.3
-.httr-oauth
-
-# knitr and R markdown default cache directories
-*_cache/
-/cache/
-
-# Temporary files created by R markdown
-*.utf8.md
-*.knit.md
-
-# R Environment Variables
-.Renviron
-
-# pkgdown site
-docs/
-
-# translation temp files
-po/*~
-
-# RStudio Connect folder
-rsconnect/
+library(terra)
+  library(sf)
+  library(suncalc)
+  library(maptiles)
+  
+  while (!is.null(dev.list())) dev.off()
+  graphics.off()
+  
+  terraOptions(todisk = FALSE, memfrac = 0.7, progress = 0)
+  
+  # path
+  
+  dir <- "E:/Arcgis/Halifax/Halifax_Shadow"
+  dsm_path <- file.path(dir, "dsm_hrm_clip.tif")
+  bld_path <- file.path(dir, "buildings_hrm_height.shp")
+  stopifnot(file.exists(dsm_path), file.exists(bld_path))
+  
+  # read path
+  
+  dsm0 <- rast(dsm_path)
+  bld0 <- vect(bld_path)
+  if (!same.crs(dsm0, bld0)) bld0 <- project(bld0, crs(dsm0))
+  
+  # downtown point
+  
+  LAT <- 44.6472208522268
+  LON <- -63.575958588626435
+  
+  BUF_M <- 1400  #800-2000
+  
+  pt_ll  <- st_sfc(st_point(c(LON, LAT)), crs = 4326)
+  pt_map <- st_transform(pt_ll, crs(dsm0))
+  xy     <- st_coordinates(pt_map)[1, ]
+  
+  ext_pt <- ext(xy[1]-BUF_M, xy[1]+BUF_M, xy[2]-BUF_M, xy[2]+BUF_M)
+  
+  dsm <- crop(dsm0, ext_pt, snap = "out")
+  bld <- crop(bld0, ext(dsm))
+  stopifnot(nrow(bld) > 0)
+  
+  rm(dsm0, bld0); gc()
+  
+  # coarsen dsm
+  
+  COARSE_FACT <- 2
+  dsm_c <- if (COARSE_FACT > 1) aggregate(dsm, fact = COARSE_FACT, fun = mean, na.rm = TRUE) else dsm
+  
+  # sun (az/alt)
+  
+  sun_az_alt <- function(datetime_local, lon, lat) {
+    sp <- getSunlightPosition(date = datetime_local, lat = lat, lon = lon)
+    list(
+      az  = (sp$azimuth * 180/pi + 180) %% 360,
+      alt =  sp$altitude * 180/pi
+    )
+  }
+  
+  # shadow mask dsm
+  
+  shadow_mask_dsm_fast <- function(dsm_r, az_deg, alt_deg,
+                                   max_dist_m = 450,
+                                   step_m = 3,
+                                   occ_eps = 0.05) {
+    if (alt_deg <= 0) {
+      out <- dsm_r; values(out) <- 1L
+      return(out)
+    }
+    
+    res_xy <- res(dsm_r)
+    step_m <- max(step_m, mean(res_xy))
+    nsteps <- max(1, ceiling(max_dist_m / step_m))
+    
+    az  <- az_deg * pi/180
+    alt <- alt_deg * pi/180
+    ux <- sin(az); uy <- cos(az)
+    
+    m <- as.matrix(dsm_r, wide = TRUE)
+    nr <- nrow(m); nc <- ncol(m)
+    
+    occ <- matrix(-1e9, nr, nc)
+    occ[is.na(m)] <- NA_real_
+    
+    shift_m <- function(mat, dx, dy) {
+      out <- matrix(NA_real_, nr, nc)
+      if (dx >= 0) { src_c1 <- 1;      src_c2 <- nc - dx; dst_c1 <- 1 + dx; dst_c2 <- nc
+      } else       { src_c1 <- 1 - dx; src_c2 <- nc;      dst_c1 <- 1;      dst_c2 <- nc + dx }
+      if (dy >= 0) { src_r1 <- 1 + dy; src_r2 <- nr;      dst_r1 <- 1;      dst_r2 <- nr - dy
+      } else       { src_r1 <- 1;      src_r2 <- nr + dy; dst_r1 <- 1 - dy; dst_r2 <- nr }
+      if (src_c1 > src_c2 || src_r1 > src_r2) return(out)
+      out[dst_r1:dst_r2, dst_c1:dst_c2] <- mat[src_r1:src_r2, src_c1:src_c2]
+      out
+    }
+    
+    for (k in seq_len(nsteps)) {
+      dist <- k * step_m
+      drop <- dist * tan(alt)
+      
+      dx_cells <- round((ux * dist) / res_xy[1])
+      dy_cells <- round((uy * dist) / res_xy[2])
+      
+      Hs <- shift_m(m, dx_cells, dy_cells)
+      cand <- Hs - drop
+      ok <- !is.na(cand) & !is.na(occ)
+      occ[ok] <- pmax(occ[ok], cand[ok])
+    }
+    
+    sh_m <- ifelse(is.na(m), NA_integer_, as.integer(occ > (m + occ_eps)))
+    sh_m[is.na(sh_m)] <- 0L
+    
+    sh <- rast(sh_m)
+    ext(sh) <- ext(dsm_r); crs(sh) <- crs(dsm_r)
+    sh
+  }
+  
+  # shadow freq
+  
+  date0 <- as.Date("2025-12-21")
+  tz0   <- "America/Halifax"
+  hours <- 11:15
+  
+  sh_sum <- dsm_c; values(sh_sum) <- 0
+  for (hh in hours) {
+    dt  <- as.POSIXct(paste(date0, sprintf("%02d:00:00", hh)), tz = tz0)
+    sun <- sun_az_alt(dt, LON, LAT)
+    sh  <- shadow_mask_dsm_fast(dsm_c, sun$az, sun$alt, max_dist_m = 450, step_m = 3, occ_eps = 0.05)
+    sh_sum <- sh_sum + sh
+    rm(sh); gc()
+  }
+  sh_freq <- sh_sum / length(hours)
+  rm(sh_sum); gc()
+  
+  # urban mask and crop
+  
+  URBAN_BUF_M <- 250
+  urb <- buffer(bld, width = URBAN_BUF_M)
+  
+  urb_mask <- rasterize(urb, sh_freq, field = 1, background = NA)
+  sh_u <- mask(sh_freq, urb_mask)
+  
+  ext_u <- ext(urb)
+  ext_u <- ext(ext_u[1]-60, ext_u[2]+60, ext_u[3]-60, ext_u[4]+60)
+  sh_u  <- crop(sh_u, ext_u, snap = "out")
+  
+  # osm tiles
+  
+  ZOOM <- 18
+  TILE_BUF_M <- 1200
+  
+  bb_poly <- pt_ll |>
+    st_transform(3857) |>
+    st_buffer(dist = TILE_BUF_M) |>
+    st_transform(4326)
+  
+  bb_use <- st_bbox(bb_poly)
+  
+  osm <- maptiles::get_tiles(
+    x        = st_as_sfc(bb_use),
+    provider = "CartoDB.Positron",
+    zoom     = ZOOM
+  )
+  
+  # Building-aligned shadow (15:00)
+  
+  dt_dir <- as.POSIXct(paste(date0, "15:00:00"), tz = tz0)
+  sun_dir <- sun_az_alt(dt_dir, LON, LAT)
+  az_deg  <- sun_dir$az
+  alt_deg <- sun_dir$alt
+  
+  h <- suppressWarnings(as.numeric(values(bld)[["HEIGHT"]]))
+  h[!is.finite(h) | h <= 0] <- NA
+  
+  A <- suppressWarnings(as.numeric(values(bld)[["Shape_Area"]]))
+  A[!is.finite(A) | A <= 0] <- NA
+  
+  q <- quantile(A, probs = c(0.33, 0.66), na.rm = TRUE, names = FALSE)
+  bin <- rep(2L, length(A))
+  bin[!is.na(A) & A <= q[1]] <- 1L
+  bin[!is.na(A) & A >  q[2]] <- 3L
+  
+  med_all <- median(h, na.rm = TRUE); if (!is.finite(med_all)) med_all <- 12
+  med1 <- median(h[bin == 1], na.rm = TRUE); if (!is.finite(med1)) med1 <- med_all
+  med2 <- median(h[bin == 2], na.rm = TRUE); if (!is.finite(med2)) med2 <- med_all
+  med3 <- median(h[bin == 3], na.rm = TRUE); if (!is.finite(med3)) med3 <- med_all
+  
+  miss <- is.na(h)
+  h[miss & bin == 1] <- med1
+  h[miss & bin == 2] <- med2
+  h[miss & bin == 3] <- med3
+  
+  cap_h <- quantile(h, 0.98, na.rm = TRUE)
+  h <- pmin(h, cap_h)
+  h[h < 3] <- 3
+  values(bld)[["height_final"]] <- h
+  
+  fine_fact <- 2
+  tmpl <- if (fine_fact > 1) disagg(sh_u, fact = fine_fact, method = "near") else sh_u
+  
+  Hf <- rasterize(bld, tmpl, field = "height_final", fun = "max", background = 0)
+  Hf[is.na(Hf)] <- 0
+  
+  Bmask <- Hf
+  Bmask[Bmask > 0] <- 1
+  Bmask[Bmask == 0] <- NA
+  
+  urb_Hf <- project(urb_mask, crs(Hf), method = "near")
+  urb_Hf <- resample(urb_Hf, Hf, method = "near")
+  
+  ground_mask <- Hf
+  ground_mask[] <- 1
+  ground_mask[!is.na(Bmask)] <- NA
+  ground_mask[is.na(urb_Hf)]  <- NA
+  
+  shadow_seed_soft_from_height <- function(H, az_deg, alt_deg, max_dist_m = 380, step_m = 3) {
+    if (alt_deg <= 0) {
+      out <- H; values(out) <- 1
+      return(out)
+    }
+    
+    res_xy <- res(H)
+    step_m <- max(step_m, mean(res_xy))
+    nsteps <- max(1, ceiling(max_dist_m / step_m))
+    
+    az  <- az_deg * pi/180
+    alt <- alt_deg * pi/180
+    ux <- sin(az); uy <- cos(az)
+    
+    m <- as.matrix(H, wide = TRUE)
+    nr <- nrow(m); nc <- ncol(m)
+    
+    occ <- matrix(0, nr, nc)
+    occ[is.na(m)] <- NA_real_
+    
+    shift_m <- function(mat, dx, dy) {
+      out <- matrix(NA_real_, nr, nc)
+      if (dx >= 0) { src_c1 <- 1;      src_c2 <- nc - dx; dst_c1 <- 1 + dx; dst_c2 <- nc
+      } else       { src_c1 <- 1 - dx; src_c2 <- nc;      dst_c1 <- 1;      dst_c2 <- nc + dx }
+      if (dy >= 0) { src_r1 <- 1 + dy; src_r2 <- nr;      dst_r1 <- 1;      dst_r2 <- nr - dy
+      } else       { src_r1 <- 1;      src_r2 <- nr + dy; dst_r1 <- 1 - dy; dst_r2 <- nr }
+      if (src_c1 > src_c2 || src_r1 > src_r2) return(out)
+      out[dst_r1:dst_r2, dst_c1:dst_c2] <- mat[src_r1:src_r2, src_c1:src_c2]
+      out
+    }
+    
+    for (k in seq_len(nsteps)) {
+      dist <- k * step_m
+      drop <- dist * tan(alt)
+      
+      dx_cells <- round((ux * dist) / res_xy[1])
+      dy_cells <- round((uy * dist) / res_xy[2])
+      
+      Hs <- shift_m(m, dx_cells, dy_cells)
+      cand <- Hs - drop
+      cand[!is.na(cand) & cand < 0] <- 0
+      
+      ok <- !is.na(cand) & !is.na(occ)
+      occ[ok] <- pmax(occ[ok], cand[ok])
+    }
+    
+    mx <- max(occ, na.rm = TRUE)
+    if (is.finite(mx) && mx > 0) occ <- occ / mx
+    
+    out <- rast(occ)
+    ext(out) <- ext(H); crs(out) <- crs(H)
+    out
+  }
+  
+  seed_soft <- shadow_seed_soft_from_height(Hf, az_deg, alt_deg, max_dist_m = 380, step_m = 3)
+  seed_soft <- mask(seed_soft, ground_mask)
+  seed_soft <- clamp(seed_soft, 0, 1, values = TRUE)
+  
+  directional_tail_soft <- function(seed, az_deg, length_m = 160, step_m = 3, decay = 0.94) {
+    tpl <- seed
+    tpl[is.na(tpl)] <- 0
+    
+    res_xy <- res(tpl)
+    step_m <- max(step_m, mean(res_xy))
+    nsteps <- max(1, ceiling(length_m / step_m))
+    
+    az <- az_deg * pi/180
+    ux <- sin(az); uy <- cos(az)
+    
+    out <- tpl; values(out) <- 0
+    wsum <- 0
+    
+    for (k in 0:nsteps) {
+      dist <- k * step_m
+      dx <- round((ux * dist) / res_xy[1])
+      dy <- round((uy * dist) / res_xy[2])
+      
+      rk <- shift(tpl, dx = dx, dy = dy)
+      rk <- resample(rk, tpl, method = "bilinear")
+      rk[is.na(rk)] <- 0
+      
+      wk <- decay^k
+      out <- out + rk * wk
+      wsum <- wsum + wk
+    }
+    
+    out / wsum
+  }
+  
+  alt_rad <- max(alt_deg * pi/180, 0.20)                 
+  LEN_M   <- min(170, max(45, 38 / tan(alt_rad)))        
+  tail    <- directional_tail_soft(seed_soft, az_deg, length_m = LEN_M, step_m = 3, decay = 0.94)
+  
+  feather_small <- function(r, sigma_cells = 0.9) {
+    k <- 2 * ceiling(3 * sigma_cells) + 1
+    k <- min(k, 25)
+    if (k %% 2 == 0) k <- k + 1
+    mid <- (k - 1)/2
+    x <- seq(-mid, mid)
+    g <- exp(-(x^2) / (2 * sigma_cells^2))
+    K <- outer(g, g, `*`)
+    K <- K / sum(K)
+    focal(r, w = K, fun = sum, na.policy = "omit", fillvalue = 0)
+  }
+  
+  tail2 <- feather_small(tail, sigma_cells = 0.9)
+  mx <- global(tail2, "max", na.rm = TRUE)[1,1]
+  if (is.finite(mx) && mx > 0) tail2 <- tail2 / mx
+  
+  shadow_nyt_low <- clamp((tail2^1.05) * 1.05, 0, 1, values = TRUE)
+  
+  mask_osm <- project(ground_mask, crs(osm), method = "near")
+  mask_osm <- resample(mask_osm, osm[[1]], method = "near")
+  
+  shadow_nyt <- project(shadow_nyt_low, crs(osm), method = "bilinear")
+  shadow_nyt <- resample(shadow_nyt, osm[[1]], method = "bilinear")
+  shadow_nyt[is.na(mask_osm)] <- NA
+  
+  # PLOT
+  
+  library(terra)
+  stable_fp <- file.path(getwd(), "shadow_nyt_stable.tif")
+  stopifnot(file.exists(stable_fp))
+  shadow_nyt <- rast(stable_fp)
+  
+  stopifnot(inherits(roads,  "SpatVector"))
+  stopifnot(inherits(bld,    "SpatVector"))
+  stopifnot(inherits(lights, "SpatVector"))
+  
+  # palette 
+  nyt_blue <- grDevices::colorRampPalette(c(
+    "#f7fbff", "#deebf7", "#c6dbef",
+    "#9ecae1", "#6baed6", "#3182bd", "#08519c"
+  ))
+  
+  # square extent 
+  e0 <- ext(shadow_nyt)
+  dx <- e0[2] - e0[1]
+  dy <- e0[4] - e0[3]
+  
+  if (dx > dy) {
+    pad <- (dx - dy) / 2
+    e_sq <- ext(e0[1], e0[2], e0[3] - pad, e0[4] + pad)
+  } else {
+    pad <- (dy - dx) / 2
+    e_sq <- ext(e0[1] - pad, e0[2] + pad, e0[3], e0[4])
+  }
+  
+  # AOI polygon 
+  aoi_r <- rast(ext=e_sq, nrows=1, ncols=1, crs=crs(shadow_nyt))
+  aoi   <- as.polygons(aoi_r)
+  rm(aoi_r)
+  
+  # crop raster to square
+  shadow_sq <- crop(shadow_nyt, e_sq, snap="out")
+  
+  # CRS-safe vectors & clip to AOI 
+  roads_p  <- if (!same.crs(roads,  shadow_sq)) project(roads,  crs(shadow_sq)) else roads
+  bld_p    <- if (!same.crs(bld,    shadow_sq)) project(bld,    crs(shadow_sq)) else bld
+  lights_p <- if (!same.crs(lights, shadow_sq)) project(lights, crs(shadow_sq)) else lights
+  
+  # preselect then intersect (so geometry never “leaks”)
+  roads_sel <- crop(roads_p,  aoi)
+  bld_sel   <- crop(bld_p,    aoi)
+  lights_sq <- crop(lights_p, aoi)
+  
+  roads_sq <- intersect(roads_sel, aoi)
+  bld_sq   <- intersect(bld_sel,   aoi)
+  
+  rm(roads_p, bld_p, lights_p, roads_sel, bld_sel, aoi); gc()
+  
+  library(terra)
+  
+  stable_fp <- file.path(getwd(), "shadow_nyt_stable.tif")
+  stopifnot(file.exists(stable_fp))
+  shadow_nyt <- rast(stable_fp)
+  
+  e0 <- ext(shadow_nyt)
+  dx <- e0[2] - e0[1]
+  dy <- e0[4] - e0[3]
+  if (dx > dy) {
+    pad <- (dx - dy) / 2
+    e_sq <- ext(e0[1], e0[2], e0[3] - pad, e0[4] + pad)
+  } else {
+    pad <- (dy - dx) / 2
+    e_sq <- ext(e0[1] - pad, e0[2] + pad, e0[3], e0[4])
+  }
+  
+  # AOI polygon
+  aoi <- as.polygons(rast(ext=e_sq, nrows=1, ncols=1, crs=crs(shadow_nyt)))
+  
+  # crop shadow
+  shadow_sq <- crop(shadow_nyt, e_sq, snap="out")
+  
+  # CRS & Clip
+  roads_p  <- if (!same.crs(roads,  shadow_sq)) project(roads,  crs(shadow_sq)) else roads
+  bld_p    <- if (!same.crs(bld,    shadow_sq)) project(bld,    crs(shadow_sq)) else bld
+  lights_p <- if (!same.crs(lights, shadow_sq)) project(lights, crs(shadow_sq)) else lights
+  
+  roads_sq <- intersect(crop(roads_p,  aoi), aoi)
+  bld_sq   <- intersect(crop(bld_p,    aoi), aoi)
+  lights_sq <- crop(lights_p, aoi)   
+  
+  rm(roads_p, bld_p, lights_p, aoi); gc()
+  
+  nyt_blue <- grDevices::colorRampPalette(c(
+    "#f7fbff", "#deebf7", "#c6dbef",
+    "#9ecae1", "#6baed6", "#3182bd", "#08519c"
+  ))
+  
+  # Expor PNG
+  outfile <- file.path(getwd(), "halifax_shadow_square.png")
+  S <- 1800
+  png(outfile, width=S, height=S, res=200)
+  
+  tryCatch({
+    
+    
+    par(mar=c(0,0,2,0), bg="white", xpd=FALSE, xaxs="i", yaxs="i")
+    
+    frame_r <- rast(ext=ext(shadow_sq), nrows=1, ncols=1, crs=crs(shadow_sq))
+    plot(frame_r, col=NA, legend=FALSE, axes=FALSE,
+         main=sprintf("Halifax — Street Network + Lights + Shadow | %s | az=%.1f alt=%.1f",
+                      date0, az_deg, alt_deg))
+    rm(frame_r)
+    
+    # clip -> usr
+    u <- par("usr")
+    graphics::clip(u[1], u[2], u[3], u[4])
+    
+    # snow base
+    rect(u[1], u[3], u[2], u[4], col="white", border=NA)
+    rect(u[1], u[3], u[2], u[4], col="#eef6ff", border=NA)
+    
+    # sea 
+    sea <- ifel(is.na(shadow_sq), 1, NA)
+    plot(sea, add=TRUE, col="#d7dee2", colNA=NA, legend=FALSE)
+    rm(sea); gc()
+    
+    # shadow
+    plot(shadow_sq, add=TRUE,
+         col=nyt_blue(180), alpha=0.92, colNA=NA,
+         legend=FALSE, maxcell=8e5, zlim=c(0.12, 0.90))
+    
+    # roads 
+    graphics::clip(u[1], u[2], u[3], u[4])
+    plot(roads_sq, add=TRUE, col="#0b1e2d", lwd=1.2,  alpha=0.18)
+    plot(roads_sq, add=TRUE, col="#1f3a4d", lwd=0.35, alpha=0.85)
+    
+    # lights 
+    base2 <- aggregate(shadow_sq, fact=18, fun=mean, na.rm=TRUE)
+    dens  <- rasterize(lights_sq, base2, field=1, fun="sum", background=0)
+    
+    K <- matrix(1,7,7); K <- K/sum(K)
+    glow <- focal(dens, w=K, fun=sum, na.policy="omit", fillvalue=0)
+    
+    mx <- global(glow, "max", na.rm=TRUE)[1,1]
+    if (is.finite(mx) && mx > 0) glow <- glow/mx
+    
+    glow2 <- resample(glow, shadow_sq, method="bilinear")
+    glow2[glow2 <= 0]   <- NA
+    glow2[glow2 < 0.04] <- NA  
+    
+    ncol <- 140
+    pal  <- grDevices::colorRampPalette(c("#fff2c2","#ffd37d","#ffb347"))(ncol)
+    rgbm <- grDevices::col2rgb(pal)/255
+    alph <- seq(0, 0.55, length.out=ncol)
+    cols_a <- grDevices::rgb(rgbm[1,], rgbm[2,], rgbm[3,], alpha=alph)
+    brks <- seq(0, 1, length.out=ncol+1)
+    
+    plot(glow2, add=TRUE, col=cols_a, breaks=brks, colNA=NA,
+         legend=FALSE, maxcell=6e5)
+    
+    rm(base2, dens, glow, glow2); gc()
+    
+    # buildings 
+    graphics::clip(u[1], u[2], u[3], u[4])
+    plot(bld_sq, add=TRUE, col="#f7f7f7", border=NA)
+    plot(bld_sq, add=TRUE, border="white",   lwd=0.9)
+    plot(bld_sq, add=TRUE, border="#2b2b2b", lwd=0.40)
+    
+  }, finally = {
+    dev.off()
+  })
+  
+  print(file.info(outfile)[, c("size","mtime")])
+  
+  shadow_cache <- list(
+    bld    = bld,
+    roads  = roads,
+    lights = lights,
+    ext    = terra::ext(shadow_nyt),
+    crs    = terra::crs(shadow_nyt),
+    params = list(
+      date0   = if (exists("date0")) date0 else NA,
+      tz0     = if (exists("tz0")) tz0 else NA,
+      az_deg  = if (exists("az_deg")) az_deg else NA,
+      alt_deg = if (exists("alt_deg")) alt_deg else NA,
+      LEN_M   = if (exists("LEN_M")) LEN_M else NA
+    )
+  )
+  terra::tmpFiles(remove = TRUE)
+  gc()
